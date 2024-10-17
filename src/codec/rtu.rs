@@ -1,9 +1,13 @@
 // SPDX-FileCopyrightText: Copyright (c) 2017-2024 slowtec GmbH <post@slowtec.de>
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use std::io::{Cursor, Error, ErrorKind, Result};
+use std::{
+    io::{Cursor, Error, ErrorKind, Result},
+    time::{Duration, Instant},
+};
 
 use byteorder::BigEndian;
+use log::warn;
 use smallvec::SmallVec;
 use tokio_util::codec::{Decoder, Encoder};
 
@@ -112,6 +116,8 @@ pub(crate) struct RequestDecoder {
 #[derive(Debug, Default)]
 pub(crate) struct ResponseDecoder {
     frame_decoder: FrameDecoder,
+    last_time: Option<Instant>,
+    last_size: usize,
 }
 
 #[derive(Debug, Default)]
@@ -176,7 +182,17 @@ fn get_response_pdu_len(adu_buf: &BytesMut) -> Result<Option<usize>> {
                     return Ok(None);
                 }
             }
-            0x81..=0xAB => 2,
+            // For custom functions, use all the buffer
+            65..=75 | 100..=110 => {
+                if adu_buf.len() > 3 {
+                    adu_buf.len() - 3
+                } else {
+                    return Ok(None);
+                }
+            }
+            // Above this value it means an exception code as the first bit is 1
+            0x81..=0xFF => 2,
+
             _ => {
                 return Err(Error::new(
                     ErrorKind::InvalidData,
@@ -231,12 +247,37 @@ impl Decoder for ResponseDecoder {
     type Error = Error;
 
     fn decode(&mut self, buf: &mut BytesMut) -> Result<Option<(SlaveId, Bytes)>> {
-        decode(
+        if let Some(last_time) = self.last_time {
+            // Check if 20 ms passed since the last burst of data
+            if last_time.elapsed() > Duration::from_millis(20) {
+                // If it was, clear the previous bytes received
+                buf.advance(self.last_size);
+                self.last_size = 0;
+            }
+        }
+
+        let resp = decode(
             "response",
             &mut self.frame_decoder,
             get_response_pdu_len,
             buf,
-        )
+        );
+
+        if let Ok(Some(_)) = resp {
+            // Restart if the frame was parsed
+            self.last_time = None;
+            // Ensure last size is cleared
+            self.last_size = 0;
+        } else {
+            if let Ok(_) = resp {
+                // Only update the last_time if the frame was not parsed
+                self.last_time = Some(Instant::now());
+            }
+            // In any case, update the last size
+            self.last_size = buf.len();
+        }
+
+        resp
     }
 }
 
@@ -249,30 +290,20 @@ fn decode<F>(
 where
     F: Fn(&BytesMut) -> Result<Option<usize>>,
 {
-    const MAX_RETRIES: usize = 20;
-
-    for _i in 0..MAX_RETRIES {
-        let result = get_pdu_len(buf).and_then(|pdu_len| {
-            let Some(pdu_len) = pdu_len else {
+    get_pdu_len(buf)
+        .and_then(|pdu_len| {
+            if let Some(pdu_len) = pdu_len {
+                frame_decoder.decode(buf, pdu_len)
+            } else {
                 // Incomplete frame
-                return Ok(None);
-            };
-
-            frame_decoder.decode(buf, pdu_len)
-        });
-
-        if let Err(err) = result {
-            log::warn!("Failed to decode {pdu_type} frame: {err}");
-            frame_decoder.recover_on_error(buf);
-            continue;
-        }
-
-        return result;
-    }
-
-    // Maximum number of retries exceeded.
-    log::error!("Giving up to decode frame after {MAX_RETRIES} retries");
-    Err(Error::new(ErrorKind::InvalidData, "Too many retries"))
+                Ok(None)
+            }
+        })
+        .or_else(|err| {
+            warn!("Failed to decode {} frame: {}", pdu_type, err);
+            //frame_decoder.recover_on_error(buf);
+            Ok(None)
+        })
 }
 
 impl Decoder for ClientCodec {
